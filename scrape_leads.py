@@ -11,7 +11,7 @@ scrape_leads.py — 自动抓取无锡环评公示，OCR识别气体用量，生
   python scrape_leads.py --no-push              # 只生成PDF，不推送企业微信
 """
 
-import os, sys, re, datetime, logging, argparse
+import os, sys, re, json, datetime, logging, argparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,10 +25,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 环境变量（先设好，gen_leads 导入时也会读取同一个 key）────────────────────
-WXWORK_KEY = os.environ.get("WXWORK_WEBHOOK_KEY", "")
+WXWORK_KEY     = os.environ.get("WXWORK_WEBHOOK_KEY", "")
+ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+OUTPUT_DIR     = os.environ.get("OUTPUT_DIR", "/tmp")
+
 if not WXWORK_KEY:
     log.warning("WXWORK_WEBHOOK_KEY 未设置，企业微信推送将失败（本地测试请加 --no-push）")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp")
+if not ANTHROPIC_KEY:
+    log.warning("ANTHROPIC_API_KEY 未设置，将跳过Claude深度分析（只做关键词匹配）")
 
 # ── 导入 gen_leads.py 中的 PDF 工具 ──────────────────────────────────────────
 # gen_leads 在加载时注册字体、读取 WXWORK_KEY，均为正常操作
@@ -291,10 +295,168 @@ def ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Claude 深度分析
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_key_sections(ocr_text: str, max_chars: int = 7000) -> str:
+    """从OCR全文中提取最相关章节（原辅料/设备/工艺），减少token消耗"""
+    section_triggers = [
+        "原辅料", "原料", "辅料", "原材料", "主要原材料",
+        "主要设备", "生产设备", "设备清单", "设备一览", "设备名称",
+        "主要产品", "生产工艺", "工艺流程", "产品方案", "生产规模",
+        "年产", "项目概况", "项目内容", "建设内容",
+    ]
+    lines   = ocr_text.split("\n")
+    buckets = []          # list of (start_line_idx, lines[])
+    in_sec  = False
+    buf     = []
+
+    for i, ln in enumerate(lines):
+        hit = any(t in ln for t in section_triggers)
+        if hit:
+            if buf:
+                buckets.append(buf)
+            buf    = [ln]
+            in_sec = True
+        elif in_sec:
+            buf.append(ln)
+            if len(buf) > 60:   # 每章节最多60行
+                buckets.append(buf)
+                buf    = []
+                in_sec = False
+    if buf:
+        buckets.append(buf)
+
+    extracted = "\n".join("\n".join(b) for b in buckets)
+    if not extracted.strip():
+        extracted = ocr_text           # 回退：全文
+
+    return extracted[:max_chars]
+
+
+# Claude 分析 prompt（三步法）
+_CLAUDE_PROMPT = """\
+你是一位资深工业气体销售专家，正在分析一份无锡新建工业项目的环评报告OCR文本。
+目标：判断该项目是否需要采购工业气体（液氧/液氮/液氩/液氦/氢气/CO₂/乙炔等），并估算用量。
+
+项目信息
+  建设单位：{company}
+  项目名称：{project_name}
+  建设地点：{location}
+
+以下是从环评PDF中OCR识别的关键段落（图片扫描，识别可能有误差）：
+---
+{key_text}
+---
+
+请按三个维度分析，只返回JSON，不要任何其他文字：
+
+{{
+  "raw_materials": {{
+    "found": true/false,
+    "gases": [
+      {{"name": "液氮", "qty": "50", "unit": "t/年", "purpose": "冷却保护气氛"}}
+    ],
+    "source": "原辅料表中找到的原文关键行（没找到则空字符串）",
+    "note": ""
+  }},
+  "equipment": {{
+    "found": true/false,
+    "items": [
+      {{"name": "液氮储罐", "spec": "10m³", "qty": "1台", "estimated_gas": "约30-50t/年"}}
+    ],
+    "source": "设备清单中气体相关设备原文（没找到则空字符串）",
+    "note": "根据储罐容积/气化器型号估算日用量或年用量的推理"
+  }},
+  "process": {{
+    "products": "主要产品（简短）",
+    "process_name": "核心工艺名称",
+    "capacity": "年产能（如有）",
+    "needs_gas": true/false,
+    "gas_types": ["液氮","氩气"],
+    "estimated_use": "根据产能估算年用量（如：液氮约20-50t/年）",
+    "reasoning": "该工艺需要气体的原因：例如热处理炉保护气氛需要氮气/氩气…",
+    "source": "原文支持句子"
+  }},
+  "verdict": {{
+    "grade": "高/中/低/无",
+    "confidence": "高/中/低",
+    "primary_basis": "raw_materials/equipment/process/none",
+    "key_finding": "最关键的一句发现",
+    "estimated_annual_qty": "综合估算年用气总量",
+    "sales_action": "建议的第一步销售动作"
+  }}
+}}
+
+评级标准（verdict.grade）：
+  高 → 原辅料表明确列出气体用量，或设备有液氧/液氮/液氩储罐，基本确定需要采购
+  中 → 工艺分析判断很可能需要气体，或有气化器/气体管道等间接证据
+  低 → 工艺上偶尔用到气体，但量少或证据不足（如维修用）
+  无 → 该项目明确不需要工业气体（住宅/餐饮/纯商业/市政）
+"""
+
+
+def analyze_with_claude(ocr_text: str, company: str,
+                         project_name: str, location: str) -> dict | None:
+    """调用Claude API对环评OCR文本进行三步深度分析，返回结构化评估（失败返回None）"""
+    if not ANTHROPIC_KEY:
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        log.warning("  anthropic包未安装（pip install anthropic），跳过Claude分析")
+        return None
+
+    key_text = extract_key_sections(ocr_text)
+    prompt   = _CLAUDE_PROMPT.format(
+        company=company, project_name=project_name,
+        location=location, key_text=key_text,
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        resp   = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        m   = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            result = json.loads(m.group())
+            grade_val = result.get("verdict", {}).get("grade", "?")
+            log.info(f"  🤖 Claude评级: {grade_val} | {result.get('verdict',{}).get('key_finding','')}")
+            return result
+        log.warning(f"  Claude返回非JSON: {raw[:120]}")
+    except json.JSONDecodeError as e:
+        log.error(f"  Claude JSON解析失败: {e}")
+    except Exception as e:
+        log.error(f"  Claude API失败: {e}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 评级
 # ══════════════════════════════════════════════════════════════════════════════
 
-def grade(ocr_result):
+def grade(ocr_result, claude_analysis=None):
+    """综合 Claude分析 + OCR关键词匹配 确定最终评级"""
+    # Claude分析优先（置信度高或中时直接用）
+    if claude_analysis:
+        v  = claude_analysis.get("verdict", {})
+        cg = v.get("grade", "")
+        cc = v.get("confidence", "")
+        if cg == "高":
+            return "高", "★★★"
+        if cg == "中":
+            return "中", "★★"
+        if cg == "低" and cc in ("高", "中"):
+            return "低", "★"
+        # Claude说"无"且置信度高 → 跳过
+        if cg == "无" and cc == "高":
+            return "无", ""
+
+    # 回退：OCR关键词匹配
     found_kws = {k for k, _, _ in ocr_result["keywords"]}
     if found_kws & HIGH_KW:
         return "高", "★★★"
@@ -309,7 +471,8 @@ def grade(ocr_result):
 # PDF 报告生成
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str):
+def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str,
+                  claude_analysis=None):
     """生成单条线索PDF报告（复用 gen_leads.py 工具函数）"""
     company      = info.get("company")      or "（未知建设单位）"
     project_name = info.get("project_name") or info.get("title", "（未知项目）")
@@ -318,7 +481,7 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str):
     accept_date  = info.get("accept_date")  or run_date_lbl
     detail_url   = info.get("detail_url",  "")
 
-    g_label, g_stars = grade(ocr_result)
+    g_label, g_stars = grade(ocr_result, claude_analysis)
 
     safe = re.sub(r"[^\w一-鿿]", "_", company[:15])
     out  = os.path.join(OUTPUT_DIR, f"{lead_id}_{safe}.pdf")
@@ -334,19 +497,33 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str):
     # ── 标题区 ────────────────────────────────────────────────────────────────
     s.append(Paragraph(f"【{g_label}】" + company, company_s))
     s.append(Paragraph(project_name, proj_s))
+
+    analysis_src = "Claude三步分析" if claude_analysis else "关键词匹配"
     s.append(Paragraph(
         f"无锡环评商机线索｜受理公示日期 {accept_date}｜"
-        f"相关度：{g_stars} {g_label}（自动OCR识别，需人工核实）",
+        f"相关度：{g_stars} {g_label}（{analysis_src}，需人工核实）",
         meta_s,
     ))
 
-    unique_kws = list(dict.fromkeys(k for k, _, _ in ocr_result["keywords"]))
-    kw_str = "、".join(unique_kws[:8]) if unique_kws else "（见OCR摘录）"
-    s.append(Paragraph(
-        f"识别到气体关键词：{kw_str}。"
-        "以下摘录来自环评PDF前40页OCR，图片版PDF识别有误差，数量/单位需对照原文核实。",
-        key_s,
-    ))
+    if claude_analysis:
+        v        = claude_analysis.get("verdict", {})
+        kf       = v.get("key_finding", "")
+        est      = v.get("estimated_annual_qty", "")
+        action   = v.get("sales_action", "")
+        summary_parts = []
+        if kf:    summary_parts.append(f"发现：{kf}")
+        if est:   summary_parts.append(f"估算用量：{est}")
+        if action:summary_parts.append(f"建议动作：{action}")
+        if summary_parts:
+            s.append(Paragraph("🤖 " + "　".join(summary_parts), key_s))
+    else:
+        unique_kws = list(dict.fromkeys(k for k, _, _ in ocr_result["keywords"]))
+        kw_str = "、".join(unique_kws[:8]) if unique_kws else "（见OCR摘录）"
+        s.append(Paragraph(
+            f"识别到气体关键词：{kw_str}。"
+            "以下摘录来自环评PDF前40页OCR，图片版PDF识别有误差，数量/单位需对照原文核实。",
+            key_s,
+        ))
     s.append(hr())
     s.append(Spacer(1, 0.3 * cm))
 
@@ -401,6 +578,83 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str):
     else:
         s.append(Paragraph("（未识别到气体关键词）", body_s))
     s.append(Spacer(1, 0.4 * cm))
+
+    # ── 三B、Claude 三步深度分析 ──────────────────────────────────────────────
+    if claude_analysis:
+        s.append(Paragraph("三B、Claude 三步深度分析", h1_s))
+        s.append(Paragraph(
+            "以下分析由 Claude AI 基于环评OCR文本自动生成，供参考，关键数据需核实原文。",
+            note_s,
+        ))
+        s.append(Spacer(1, 0.15 * cm))
+
+        # 原辅料
+        rm = claude_analysis.get("raw_materials", {})
+        s.append(Paragraph("① 原辅料/原料清单分析", key_s))
+        if rm.get("found") and rm.get("gases"):
+            rows = [[g.get("name",""), f"{g.get('qty','')} {g.get('unit','')}".strip(),
+                     g.get("purpose","")] for g in rm["gases"]]
+            s.append(dark_tbl(["气体名称", "用量", "用途"], rows, [3*cm, 4*cm, 9.5*cm]))
+        else:
+            s.append(Paragraph("原辅料表中未发现气体直接列项。", body_s))
+        if rm.get("source"):
+            s.append(Paragraph(f"原文依据：{rm['source'][:120]}", note_s))
+        if rm.get("note"):
+            s.append(Paragraph(rm["note"][:120], note_s))
+        s.append(Spacer(1, 0.25 * cm))
+
+        # 设备
+        eq = claude_analysis.get("equipment", {})
+        s.append(Paragraph("② 主要设备分析", key_s))
+        if eq.get("found") and eq.get("items"):
+            rows = [[i.get("name",""), i.get("spec",""), i.get("qty",""),
+                     i.get("estimated_gas","")] for i in eq["items"]]
+            s.append(dark_tbl(["设备名称", "规格", "数量", "估算用气"],
+                               rows, [4*cm, 3*cm, 2*cm, 7.5*cm]))
+        else:
+            s.append(Paragraph("设备清单中未发现气体储罐/气化器等直接设施。", body_s))
+        if eq.get("source"):
+            s.append(Paragraph(f"原文依据：{eq['source'][:120]}", note_s))
+        if eq.get("note"):
+            s.append(Paragraph(eq["note"][:150], note_s))
+        s.append(Spacer(1, 0.25 * cm))
+
+        # 工艺
+        pr = claude_analysis.get("process", {})
+        s.append(Paragraph("③ 生产工艺分析", key_s))
+        proc_rows = []
+        if pr.get("products"):
+            proc_rows.append(["主要产品", pr["products"][:80]])
+        if pr.get("process_name"):
+            proc_rows.append(["核心工艺", pr["process_name"][:80]])
+        if pr.get("capacity"):
+            proc_rows.append(["生产规模", pr["capacity"][:80]])
+        if pr.get("gas_types"):
+            proc_rows.append(["所需气体", "、".join(pr["gas_types"])])
+        if pr.get("estimated_use"):
+            proc_rows.append(["估算用量", pr["estimated_use"][:80]])
+        if proc_rows:
+            s.append(info_tbl(proc_rows))
+        if pr.get("reasoning"):
+            s.append(Paragraph(f"分析依据：{pr['reasoning'][:200]}", body_s))
+        s.append(Spacer(1, 0.25 * cm))
+
+        # 综合评估
+        v = claude_analysis.get("verdict", {})
+        s.append(Paragraph("④ Claude 综合评估", key_s))
+        verdict_rows = []
+        if v.get("grade"):
+            verdict_rows.append(["评级",
+                f"{v['grade']}（置信度：{v.get('confidence','—')}，依据：{v.get('primary_basis','—')}）"])
+        if v.get("key_finding"):
+            verdict_rows.append(["关键发现", v["key_finding"][:100]])
+        if v.get("estimated_annual_qty"):
+            verdict_rows.append(["估算年用量", v["estimated_annual_qty"][:80]])
+        if v.get("sales_action"):
+            verdict_rows.append(["建议动作", v["sales_action"][:100]])
+        if verdict_rows:
+            s.append(info_tbl(verdict_rows))
+        s.append(Spacer(1, 0.4 * cm))
 
     # ── 四、跟进建议 ──────────────────────────────────────────────────────────
     s.append(Paragraph("四、跟进建议（自动生成）", h1_s))
@@ -499,16 +753,32 @@ def run_for_date(target_date: datetime.date, no_push: bool = False):
 
         ocr = ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120)
 
-        if not ocr["found"]:
-            skipped.append((title, "OCR未发现气体关键词"))
+        # ── Step 4B：Claude深度分析（始终尝试，补充OCR盲区）────────────────
+        claude = analyze_with_claude(
+            ocr["raw_text"], company, project_name, location
+        )
+
+        # 判断是否为有效线索：OCR发现关键词 OR Claude评为高/中
+        claude_grade = (claude or {}).get("verdict", {}).get("grade", "")
+        ocr_found    = ocr["found"]
+        is_relevant  = ocr_found or claude_grade in ("高", "中")
+
+        # Claude明确判断为"无"且置信度高 → 跳过（即使OCR有词也尊重Claude）
+        if claude_grade == "无" and (claude or {}).get("verdict", {}).get("confidence") == "高":
+            log.info("  🤖 Claude: 该项目不需要工业气体，跳过")
+            skipped.append((title, "Claude判定无气体需求"))
+            continue
+
+        if not is_relevant:
+            skipped.append((title, "OCR未发现关键词且Claude无相关评级"))
             continue
 
         # ── Step 5：生成PDF报告 ────────────────────────────────────────────
         lead_id = f"AUTO-{target_date.strftime('%Y%m%d')}-{counter:02d}"
         counter += 1
         try:
-            pdf_path = make_lead_pdf(info, ocr, lead_id, pdf_url, run_date_lbl)
-            g_label, g_stars = grade(ocr)
+            pdf_path = make_lead_pdf(info, ocr, lead_id, pdf_url, run_date_lbl, claude)
+            g_label, g_stars = grade(ocr, claude)
             leads.append((company, project_name, g_label, g_stars, pdf_path))
         except Exception as e:
             log.error(f"  PDF生成失败: {e}", exc_info=True)

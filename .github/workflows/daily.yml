@@ -48,6 +48,7 @@ jobs:
       - name: 抓取环评公示并推送企业微信
         env:
           WXWORK_WEBHOOK_KEY: ${{ secrets.WXWORK_WEBHOOK_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
           OUTPUT_DIR: /tmp
           PYTHONIOENCODING: utf-8
         run: |

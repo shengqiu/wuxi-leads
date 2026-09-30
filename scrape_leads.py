@@ -11,7 +11,8 @@ scrape_leads.py — 自动抓取无锡环评公示，OCR识别气体用量，生
   python scrape_leads.py --no-push              # 只生成PDF，不推送企业微信
 """
 
-import os, sys, re, json, datetime, logging, argparse
+import os, sys, re, json, base64, datetime, logging, argparse
+from io import BytesIO
 
 import requests
 from bs4 import BeautifulSoup
@@ -219,10 +220,144 @@ def fetch_detail(detail_url):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 平面图视觉分析（Claude Vision）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 图纸页识别关键词（页面OCR中含这些词 → 大概率是图纸）
+_DIAGRAM_KW = [
+    "平面图", "布置图", "总平面", "设备布置", "工艺流程图",
+    "管道图", "图例", "方位", "图号", "比例", "方向",
+    "N↑", "North", "图纸", "设备图", "车间平面",
+]
+
+_VISION_PROMPT = """\
+以上是「{company}」{project_name}环评报告中的 {n} 张图纸页面。
+
+请仔细识别每张图中所有气体相关设备和设施，重点寻找：
+  • 低温液体储罐（液氧/液氮/液氩/液氦储罐，标注 LOX/LIN/LAr/LHe/低温储罐 或容积如 10m³/5000L）
+  • 气化器 / 汽化器 / Vaporizer
+  • 气体管道（供氮管道/供氧管道/保护气体管线，标注 G-N₂/G-O₂/DN50 等）
+  • 气瓶组 / 汇流排 / 气瓶间
+  • 制氮机 / 制氧机 / 空分设备 / 氮气发生器
+  • 压缩空气站 / 储气罐 / 空压机
+  • 乙炔站 / CO₂供应间
+  • 任何含"气"字或气体相关的设施标注
+
+只返回 JSON，不要其他文字：
+{{
+  "has_gas_equipment": true或false,
+  "equipment": [
+    {{
+      "page": 第几页编号（整数）,
+      "name": "设备名称（如液氮储罐）",
+      "spec": "规格（如10m³/DN50，没有则空字符串）",
+      "qty": "数量（如2台，没有则空字符串）",
+      "location": "在图中位置（如厂区北侧，没有则空字符串）",
+      "estimated_annual_gas": "估算年用气量（能推断则填，如约30-50t/年，否则空字符串）",
+      "confidence": "高/中/低"
+    }}
+  ],
+  "summary": "一句话总结发现（如：第3页设备布置图中发现10m³液氮储罐和气化器各1台；若无发现则写'未发现气体相关设备'）",
+  "diagram_pages": [有图纸内容的页码列表（整数）]
+}}"""
+
+
+def _analyze_floor_plans_with_vision(images, page_texts, company, project_name):
+    """
+    对PDF图片页面做Claude视觉分析，识别平面图/设备布置图中的气体设备。
+    返回 {"found": bool, "equipment": [...], "pages_analyzed": [int,...], "summary": str}
+    """
+    empty = {"found": False, "equipment": [], "pages_analyzed": [], "summary": ""}
+
+    if not ANTHROPIC_KEY:
+        return {**empty, "summary": "未设置ANTHROPIC_API_KEY，跳过视觉分析"}
+    try:
+        import anthropic
+    except ImportError:
+        return {**empty, "summary": "未安装anthropic包"}
+
+    # ── 识别候选图纸页 ────────────────────────────────────────────────────────
+    candidates = []
+    for i, (img, txt) in enumerate(zip(images, page_texts)):
+        nonempty = [l for l in txt.split("\n") if l.strip()]
+        is_diagram = (
+            len(nonempty) < 20                         # 文字极少 → 很可能是图纸
+            or any(kw in txt for kw in _DIAGRAM_KW)   # OCR含图纸关键词
+        )
+        if is_diagram:
+            candidates.append((i + 1, img))
+
+    # 没找到明确图纸 → 取文字最少的一半页面（图纸往往文字稀疏）
+    if not candidates and images:
+        scored = sorted(
+            enumerate(page_texts),
+            key=lambda x: len([l for l in x[1].split("\n") if l.strip()])
+        )
+        half = max(1, len(images) // 2)
+        candidates = [(idx + 1, images[idx]) for idx, _ in scored[:half]]
+
+    page_nums  = [p for p, _ in candidates]
+    log.info(f"  📐 视觉分析图纸页（共{len(candidates)}张）：{page_nums}")
+
+    # ── 构建多图 content ──────────────────────────────────────────────────────
+    content = []
+    for page_num, img in candidates:
+        # 缩放到最大宽1200（保证可读且省token）
+        w, h = img.size
+        if w > 1200:
+            img = img.resize((1200, int(h * 1200 / w)))
+
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=72)
+        b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+        content.append({"type": "text",  "text": f"【第{page_num}页】"})
+        content.append({"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg", "data": b64,
+        }})
+
+    content.append({"type": "text", "text": _VISION_PROMPT.format(
+        company=company, project_name=project_name, n=len(candidates),
+    )})
+
+    # ── 调用Claude Vision ─────────────────────────────────────────────────────
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        resp   = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1400,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = resp.content[0].text.strip()
+        m   = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            data  = json.loads(m.group())
+            found = data.get("has_gas_equipment", False)
+            equip = data.get("equipment", [])
+            summ  = data.get("summary", "")
+            log.info(f"  📐 平面图分析：{'✅ 发现' if found else '❌ 未发现'}气体设备"
+                     + (f"（{len(equip)}项）" if equip else ""))
+            return {
+                "found":          found,
+                "equipment":      equip,
+                "pages_analyzed": page_nums,
+                "diagram_pages":  data.get("diagram_pages", []),
+                "summary":        summ,
+            }
+        log.warning(f"  平面图分析返回非JSON: {raw[:120]}")
+    except json.JSONDecodeError as e:
+        log.error(f"  平面图分析JSON解析失败: {e}")
+    except Exception as e:
+        log.error(f"  平面图分析API失败: {e}")
+
+    return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # OCR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120):
+def ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120, company="", project_name=""):
     """
     下载PDF → OCR前N页 → 搜索气体关键词
     返回 {"found": bool, "keywords": [(kw,page,line),...], "snippets": [str,...], "raw_text": str}
@@ -291,6 +426,16 @@ def ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120):
         log.info(f"  ✅ 气体关键词: {unique}")
     else:
         log.info("  ❌ 未发现气体关键词")
+
+    # ── 平面图视觉分析（复用已转换的图片，不再重新下载）────────────────────
+    fp = _analyze_floor_plans_with_vision(images, page_texts, company, project_name)
+    result["floor_plan"] = fp
+
+    # 视觉分析发现设备 → 更新 found 状态（确保不遗漏）
+    if fp.get("found"):
+        result["found"] = True
+        log.info(f"  📐 视觉发现气体设备：{fp.get('summary','')}")
+
     return result
 
 
@@ -397,7 +542,8 @@ _CLAUDE_PROMPT = """\
 
 
 def analyze_with_claude(ocr_text: str, company: str,
-                         project_name: str, location: str) -> dict | None:
+                         project_name: str, location: str,
+                         floor_plan: dict | None = None) -> dict | None:
     """调用Claude API对环评OCR文本进行三步深度分析，返回结构化评估（失败返回None）"""
     if not ANTHROPIC_KEY:
         return None
@@ -408,9 +554,24 @@ def analyze_with_claude(ocr_text: str, company: str,
         return None
 
     key_text = extract_key_sections(ocr_text)
-    prompt   = _CLAUDE_PROMPT.format(
+
+    # 把平面图视觉分析结论拼入prompt，让Claude综合判断
+    fp_context = ""
+    if floor_plan and floor_plan.get("found"):
+        equip_lines = "\n".join(
+            f"  • {e.get('name','')} {e.get('spec','')} ×{e.get('qty','')} "
+            f"[第{e.get('page','?')}页] {e.get('estimated_annual_gas','')}"
+            for e in floor_plan.get("equipment", [])
+        )
+        fp_context = (
+            f"\n\n【⚠️ 平面图视觉分析已发现以下气体设备，请在原辅料/设备维度中参考】\n"
+            f"{equip_lines}\n"
+            f"（{floor_plan.get('summary','')}）"
+        )
+
+    prompt = _CLAUDE_PROMPT.format(
         company=company, project_name=project_name,
-        location=location, key_text=key_text,
+        location=location, key_text=key_text + fp_context,
     )
 
     try:
@@ -577,6 +738,43 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str,
         ))
     else:
         s.append(Paragraph("（未识别到气体关键词）", body_s))
+    s.append(Spacer(1, 0.4 * cm))
+
+    # ── 三A、平面图视觉分析 ───────────────────────────────────────────────────
+    fp = ocr_result.get("floor_plan", {})
+    s.append(Paragraph("三A、平面图设备视觉分析（Claude Vision）", h1_s))
+    pages_str = "、".join(f"第{p}页" for p in fp.get("pages_analyzed", []))
+    s.append(Paragraph(
+        f"已分析图纸页：{pages_str or '—'}。"
+        "Claude直接读取平面图/设备布置图识别气体设备，比OCR文字更准确。",
+        note_s,
+    ))
+    s.append(Spacer(1, 0.15 * cm))
+
+    if fp.get("found") and fp.get("equipment"):
+        rows = [
+            [
+                str(e.get("page", "?")),
+                e.get("name", ""),
+                e.get("spec", "—"),
+                e.get("qty", "—"),
+                e.get("location", "—"),
+                e.get("estimated_annual_gas", "—"),
+            ]
+            for e in fp["equipment"]
+        ]
+        s.append(dark_tbl(
+            ["页", "设备名称", "规格", "数量", "位置", "估算年用气"],
+            rows,
+            [1*cm, 4*cm, 2.5*cm, 1.5*cm, 3*cm, 4.5*cm],
+        ))
+        if fp.get("summary"):
+            s.append(Paragraph(f"💡 {fp['summary']}", key_s))
+    else:
+        s.append(Paragraph(
+            fp.get("summary") or "平面图/布置图中未识别到明显气体设备标注。",
+            body_s,
+        ))
     s.append(Spacer(1, 0.4 * cm))
 
     # ── 三B、Claude 三步深度分析 ──────────────────────────────────────────────
@@ -751,11 +949,15 @@ def run_for_date(target_date: datetime.date, no_push: bool = False):
             info["pdf_urls"][0],
         )
 
-        ocr = ocr_pdf_for_gas(pdf_url, max_pages=40, dpi=120)
+        ocr = ocr_pdf_for_gas(
+            pdf_url, max_pages=40, dpi=120,
+            company=company, project_name=project_name,
+        )
 
-        # ── Step 4B：Claude深度分析（始终尝试，补充OCR盲区）────────────────
+        # ── Step 4B：Claude深度分析（整合平面图结论+OCR文字）───────────────
         claude = analyze_with_claude(
-            ocr["raw_text"], company, project_name, location
+            ocr["raw_text"], company, project_name, location,
+            floor_plan=ocr.get("floor_plan"),
         )
 
         # 判断是否为有效线索：OCR发现关键词 OR Claude评为高/中

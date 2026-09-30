@@ -15,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
 # ── 环境变量 ────────────────────────────────────────────────────────────────
-WXWORK_KEY = os.environ["WXWORK_WEBHOOK_KEY"]   # GitHub Secret
+WXWORK_KEY = os.environ.get("WXWORK_WEBHOOK_KEY", "")  # GitHub Secret (optional for --no-push)
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp")
 
 # ── 字体 ────────────────────────────────────────────────────────────────────

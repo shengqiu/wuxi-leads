@@ -5,6 +5,15 @@ on:
     # 每天 00:00 UTC = 北京时间 08:00
     - cron: '0 0 * * *'
   workflow_dispatch:   # 允许手动触发
+    inputs:
+      date:
+        description: '指定日期 YYYY-MM-DD（留空=今天北京时间）'
+        required: false
+        default: ''
+      days:
+        description: '往前查几天（默认1天）'
+        required: false
+        default: '1'
 
 jobs:
   generate-and-send:
@@ -41,7 +50,16 @@ jobs:
           WXWORK_WEBHOOK_KEY: ${{ secrets.WXWORK_WEBHOOK_KEY }}
           OUTPUT_DIR: /tmp
           PYTHONIOENCODING: utf-8
-        run: python scrape_leads.py
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          DAYS="${{ github.event.inputs.days }}"
+          if [ -n "$DAYS" ] && [ "$DAYS" != "1" ]; then
+            ARGS="$ARGS --days $DAYS"
+          fi
+          python scrape_leads.py $ARGS
 
       - name: 上传 PDF（保留7天）
         if: always()

@@ -2,9 +2,16 @@
 """
 scrape_leads.py — 自动抓取无锡环评公示，OCR识别气体用量，生成线索报告推送企业微信
 每天 GitHub Actions 08:00 北京时间运行
+
+用法：
+  python scrape_leads.py                        # 今天（北京时间）
+  python scrape_leads.py --date 2026-09-28      # 指定某天
+  python scrape_leads.py --days 3               # 最近3天（含今天）
+  python scrape_leads.py --date 2026-09-28 --days 3   # 从09-28往前3天
+  python scrape_leads.py --no-push              # 只生成PDF，不推送企业微信
 """
 
-import os, sys, re, datetime, logging
+import os, sys, re, datetime, logging, argparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,7 +25,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 环境变量（先设好，gen_leads 导入时也会读取同一个 key）────────────────────
-WXWORK_KEY = os.environ["WXWORK_WEBHOOK_KEY"]
+WXWORK_KEY = os.environ.get("WXWORK_WEBHOOK_KEY", "")
+if not WXWORK_KEY:
+    log.warning("WXWORK_WEBHOOK_KEY 未设置，企业微信推送将失败（本地测试请加 --no-push）")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp")
 
 # ── 导入 gen_leads.py 中的 PDF 工具 ──────────────────────────────────────────
@@ -106,9 +115,9 @@ def _get(url, timeout=30, stream=False):
         return None
 
 
-def fetch_today_notices():
-    """抓取列表页，返回今日公示 [(title, date_str, detail_url), ...]"""
-    log.info(f"搜索今日公示（{TODAY_STR}）...")
+def fetch_today_notices(target_date_str: str):
+    """抓取列表页，返回指定日期公示 [(title, date_str, detail_url), ...]"""
+    log.info(f"搜索公示（{target_date_str}）...")
     results = []
 
     for page in range(1, 6):   # 最多检查5页
@@ -134,17 +143,17 @@ def fetch_today_notices():
             date_str  = date_span.get_text(strip=True) if date_span else ""
             page_items.append((title, date_str, detail_url))
 
-        today_items = [(t, d, u) for t, d, u in page_items if d == TODAY_STR]
-        results.extend(today_items)
-        log.info(f"  第{page}页：{len(page_items)}条，今日{len(today_items)}条")
+        day_items = [(t, d, u) for t, d, u in page_items if d == target_date_str]
+        results.extend(day_items)
+        log.info(f"  第{page}页：{len(page_items)}条，目标日期{len(day_items)}条")
 
-        # 若本页无今日条目，或当前页最早日期已早于今日，停止翻页
-        if page_items and not today_items:
+        # 若本页无目标日期条目，停止翻页
+        if page_items and not day_items:
             break
         if not page_items:
             break
 
-    log.info(f"今日共 {len(results)} 条公示")
+    log.info(f"共 {len(results)} 条公示")
     return results
 
 
@@ -300,13 +309,13 @@ def grade(ocr_result):
 # PDF 报告生成
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_lead_pdf(info, ocr_result, lead_id, pdf_url):
+def make_lead_pdf(info, ocr_result, lead_id, pdf_url, run_date_lbl: str):
     """生成单条线索PDF报告（复用 gen_leads.py 工具函数）"""
     company      = info.get("company")      or "（未知建设单位）"
     project_name = info.get("project_name") or info.get("title", "（未知项目）")
     location     = info.get("location")     or "—"
     env_agency   = info.get("env_agency")   or "—"
-    accept_date  = info.get("accept_date")  or TODAY_LBL
+    accept_date  = info.get("accept_date")  or run_date_lbl
     detail_url   = info.get("detail_url",  "")
 
     g_label, g_stars = grade(ocr_result)
@@ -314,7 +323,7 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url):
     safe = re.sub(r"[^\w一-鿿]", "_", company[:15])
     out  = os.path.join(OUTPUT_DIR, f"{lead_id}_{safe}.pdf")
 
-    on_first, on_later = make_page_callbacks(company, TODAY_LBL)
+    on_first, on_later = make_page_callbacks(company, run_date_lbl)
     doc = SimpleDocTemplate(
         out, pagesize=A4,
         leftMargin=2*cm, rightMargin=2*cm,
@@ -428,23 +437,28 @@ def make_lead_pdf(info, ocr_result, lead_id, pdf_url):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 主流程
+# 单日流程
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def run_for_date(target_date: datetime.date, no_push: bool = False):
+    """针对指定日期运行完整抓取→OCR→生成→推送流程"""
+    target_date_str = target_date.strftime("%Y/%m/%d")   # 公示页格式
+    run_date_lbl    = target_date.strftime("%Y-%m-%d")   # 文件名/报告格式
+
     log.info("=" * 60)
-    log.info(f"无锡环评工业气体线索自动抓取 · {TODAY_LBL}")
+    log.info(f"无锡环评工业气体线索自动抓取 · {run_date_lbl}")
     log.info("=" * 60)
 
-    # ── Step 1：获取今日公示 ───────────────────────────────────────────────
-    notices = fetch_today_notices()
+    # ── Step 1：获取指定日期公示 ──────────────────────────────────────────
+    notices = fetch_today_notices(target_date_str)
     if not notices:
-        msg = f"📋 无锡环评 · {TODAY_LBL}\n今日无新受理公示。"
-        wxwork_text(msg)
-        log.info("今日无公示，已通知。")
+        msg = f"📋 无锡环评 · {run_date_lbl}\n当日无新受理公示。"
+        if not no_push:
+            wxwork_text(msg)
+        log.info("无公示，已通知。")
         return
 
-    log.info(f"\n今日 {len(notices)} 条公示，开始逐条处理...\n")
+    log.info(f"\n{run_date_lbl} 共 {len(notices)} 条公示，开始逐条处理...\n")
 
     leads   = []   # [(company, project_name, grade_label, grade_stars, pdf_path), ...]
     skipped = []   # [(title, reason), ...]
@@ -464,14 +478,14 @@ def main():
         project_name = info.get("project_name") or title
         combined     = company + project_name + title
 
-        # ── Step 3：排除明确非工业项目 ───────────────────────────────────
+        # ── Step 3：排除明确非工业项目 ────────────────────────────────────
         skip_hit = next((kw for kw in SKIP_KEYWORDS if kw in combined), None)
         if skip_hit:
             log.info(f"  跳过（排除词「{skip_hit}」）")
             skipped.append((title, f"排除关键词「{skip_hit}」"))
             continue
 
-        # ── Step 4：下载+OCR PDF ──────────────────────────────────────────
+        # ── Step 4：下载+OCR PDF ───────────────────────────────────────────
         if not info["pdf_urls"]:
             log.warning("  未找到PDF链接，跳过")
             skipped.append((title, "无PDF链接"))
@@ -489,16 +503,16 @@ def main():
             skipped.append((title, "OCR未发现气体关键词"))
             continue
 
-        # ── Step 5：生成PDF报告 ───────────────────────────────────────────
-        lead_id = f"AUTO-{TODAY_BJ.strftime('%Y%m%d')}-{counter:02d}"
+        # ── Step 5：生成PDF报告 ────────────────────────────────────────────
+        lead_id = f"AUTO-{target_date.strftime('%Y%m%d')}-{counter:02d}"
         counter += 1
         try:
-            pdf_path = make_lead_pdf(info, ocr, lead_id, pdf_url)
+            pdf_path = make_lead_pdf(info, ocr, lead_id, pdf_url, run_date_lbl)
             g_label, g_stars = grade(ocr)
             leads.append((company, project_name, g_label, g_stars, pdf_path))
         except Exception as e:
             log.error(f"  PDF生成失败: {e}", exc_info=True)
-            skipped.append((title, f"PDF生成失败"))
+            skipped.append((title, "PDF生成失败"))
 
     # ── Step 6：企业微信推送 ───────────────────────────────────────────────
     log.info("\n=== 企业微信推送 ===")
@@ -507,12 +521,15 @@ def main():
 
     if not leads:
         msg = (
-            f"📋 无锡环评 · {TODAY_LBL}\n"
-            f"今日 {len(notices)} 条公示，未发现工业气体相关项目。\n"
+            f"📋 无锡环评 · {run_date_lbl}\n"
+            f"共 {len(notices)} 条公示，未发现工业气体相关项目。\n"
             f"（已处理 {len(notices) - len(skipped)} 条 / 跳过 {len(skipped)} 条）"
         )
-        wxwork_text(msg)
-        log.info("无有效线索，已推送通知。")
+        if not no_push:
+            wxwork_text(msg)
+        else:
+            log.info(f"[--no-push] {msg}")
+        log.info("无有效线索。")
         return
 
     # 文字摘要
@@ -521,22 +538,90 @@ def main():
         lines.append(f"{ICONS.get(gl,'⚫')} {comp[:15]} · {proj[:20]}\n   {gs} {gl}（OCR自动识别）")
 
     summary = (
-        f"📋 无锡环评气体线索 · {TODAY_LBL}\n\n"
-        f"今日 {len(notices)} 条公示，发现 {len(leads)} 条潜在线索：\n\n"
+        f"📋 无锡环评气体线索 · {run_date_lbl}\n\n"
+        f"共 {len(notices)} 条公示，发现 {len(leads)} 条潜在线索：\n\n"
         + "\n\n".join(lines)
-        + f"\n\n⚠️ 评级基于OCR自动识别，需人工核实原文\n"
-        f"详细报告见下方文件。"
+        + "\n\n⚠️ 评级基于OCR自动识别，需人工核实原文\n"
+        "详细报告见下方文件。"
     )
-    r = wxwork_text(summary)
-    log.info(f"文字摘要推送：{r}")
+
+    if not no_push:
+        r = wxwork_text(summary)
+        log.info(f"文字摘要推送：{r}")
+    else:
+        log.info(f"[--no-push] 文字摘要：\n{summary}")
 
     # 发送各PDF
     for comp, proj, gl, gs, pdf_path in leads:
         label = f"{comp[:10]} · {proj[:15]}"
-        ok = wxwork_upload_and_send(pdf_path, label)
-        log.info(f"  {'✅' if ok else '❌'} {label}")
+        if not no_push:
+            ok = wxwork_upload_and_send(pdf_path, label)
+            log.info(f"  {'✅' if ok else '❌'} {label}")
+        else:
+            log.info(f"  [--no-push] 已生成: {pdf_path}")
 
     log.info(f"\n=== 完成 ===  线索：{len(leads)}  跳过：{len(skipped)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 入口
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="无锡环评工业气体线索自动抓取",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+用法举例：
+  python scrape_leads.py                         # 今天（北京时间）
+  python scrape_leads.py --date 2026-09-28       # 指定某天
+  python scrape_leads.py --days 3                # 最近3天（含今天）
+  python scrape_leads.py --date 2026-09-28 --days 3    # 从09-28往前3天
+  python scrape_leads.py --no-push               # 只生成PDF，不推送企业微信
+        """,
+    )
+    parser.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        help="指定结束日期（默认：北京时间今日）",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=1,
+        metavar="N",
+        help="往前查几天，包含结束日期（默认：1，即只查 --date 那天）",
+    )
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help="只生成PDF，不推送企业微信（本地测试用）",
+    )
+    args = parser.parse_args()
+
+    # 确定结束日期
+    if args.date:
+        try:
+            end_date = datetime.date.fromisoformat(args.date)
+        except ValueError:
+            log.error(f"日期格式错误（须 YYYY-MM-DD）：{args.date}")
+            sys.exit(1)
+    else:
+        end_date = TODAY_BJ
+
+    # 构建日期列表（从早到晚排序）
+    dates = sorted([
+        end_date - datetime.timedelta(days=i)
+        for i in range(args.days)
+    ])
+
+    if len(dates) > 1:
+        log.info(f"将处理 {len(dates)} 天：{dates[0]} → {dates[-1]}")
+    if args.no_push:
+        log.info("--no-push 模式：只生成PDF，不推送企业微信")
+
+    for target_date in dates:
+        run_for_date(target_date, no_push=args.no_push)
 
 
 if __name__ == "__main__":
